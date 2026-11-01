@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>mettaton cast receiver</title>
+<script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; background: #1c1d1f; color: #e8e8e8;
+               font: 48px sans-serif; display: grid; place-items: center; }
+</style>
+</head>
+<body>
+<div>mettaton receiver: hello</div>
+<script>
+  cast.framework.CastReceiverContext.getInstance().start({ disableIdleTimeout: true });
+</script>
+</body>
+</html>
