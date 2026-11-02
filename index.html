@@ -45,7 +45,7 @@
 </div></div>
 <script>
 "use strict";
-const VERSION = "6";
+const VERSION = "7";
 const NS = "urn:x-cast:io.github.flashgnash.mettaton";
 const SEEK_STEP_S = 10;
 // One press can arrive by more than one path (a key and a media command).
@@ -382,7 +382,10 @@ document.addEventListener("visibilitychange", () => send({ type: "visible", visi
 // CAF rejects every media command while no media is loaded, so while a sender
 // is bound the page holds one: a second of generated silence, looped, never
 // fetched from anywhere.
-const holder = document.createElement("audio");
+// A video element and a video type: as audio, Google TV draws its own
+// now-playing screen over the page.
+const holder = document.createElement("video");
+holder.muted = true;
 let holderUrl = null;
 function silence() {
   const rate = 8000, n = rate, b = new DataView(new ArrayBuffer(44 + n));
@@ -393,7 +396,8 @@ function silence() {
   for (let i = 0; i < n; i++) b.setUint8(44 + i, 128);
   return b.buffer;
 }
-function holdSession() {
+function holdSession(kind) {
+  if (kind === "none") return send({ type: "session", held: false, why: "not asked for" });
   const pm = ctx.getPlayerManager();
   if (!holderUrl) holderUrl = URL.createObjectURL(new Blob([silence()], { type: "audio/wav" }));
   try {
@@ -402,7 +406,7 @@ function holdSession() {
     req.media = new cast.framework.messages.MediaInformation();
     req.media.contentId = holderUrl;
     req.media.contentUrl = holderUrl;
-    req.media.contentType = "audio/wav";
+    req.media.contentType = kind === "audio" ? "audio/wav" : "video/mp4";
     req.media.streamType = cast.framework.messages.StreamType.LIVE;
     req.media.metadata = new cast.framework.messages.GenericMediaMetadata();
     req.media.metadata.title = bound && bound.from ? "Casting from " + bound.from : "Casting";
@@ -434,7 +438,7 @@ ctx.addCustomMessageListener(NS, (e) => {
     bound = { sender: e.senderId, token: m.token, from: typeof m.from === "string" ? m.from.slice(0, 64) : "", debug: m.debug === true };
     show("connecting", "Connecting", bound.from ? "from " + bound.from : "");
     send(Object.assign({ type: "ready" }, caps()));
-    holdSession();
+    holdSession(typeof m.hold === "string" ? m.hold : "video");
     return;
   }
   if (!bound || e.senderId !== bound.sender || m.token !== bound.token) return;
