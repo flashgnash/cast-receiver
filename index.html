@@ -45,7 +45,7 @@
 </div></div>
 <script>
 "use strict";
-const VERSION = "8";
+const VERSION = "9";
 const NS = "urn:x-cast:io.github.flashgnash.mettaton";
 const SEEK_STEP_S = 10;
 // One press can arrive by more than one path (a key and a media command).
@@ -86,6 +86,22 @@ for (const level of ["log", "info", "warn", "error"]) {
 window.addEventListener("error", (e) => debug("error", (e.message || "") + " at " + (e.filename || "") + ":" + (e.lineno || "")));
 window.addEventListener("unhandledrejection", (e) => debug("rejection", e.reason && (e.reason.stack || e.reason)));
 
+// The picture's mean brightness as decoded (0-255), read back through a
+// small canvas: a black screen over a bright picture is the compositor's.
+function luma() {
+  try {
+    const c = document.createElement("canvas");
+    c.width = 32;
+    c.height = 18;
+    const g = c.getContext("2d");
+    g.drawImage(video, 0, 0, 32, 18);
+    const d = g.getImageData(0, 0, 32, 18).data;
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 4) sum += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+    return Math.round(sum / (d.length / 4));
+  } catch (e) { return String(e); }
+}
+
 // Everything the page knows about itself now.
 function report() {
   let player = null;
@@ -96,7 +112,7 @@ function report() {
   return {
     type: "report", version: VERSION, state: document.body.className, headline: $("headline").textContent,
     pc: pc ? { connection: pc.connectionState, ice: pc.iceConnectionState } : null,
-    video: { w: video.videoWidth, h: video.videoHeight, paused: video.paused, readyState: video.readyState },
+    video: { w: video.videoWidth, h: video.videoHeight, paused: video.paused, readyState: video.readyState, luma: luma() },
     overlay: overlayOpen(), overlayChoice, player, visible: document.visibilityState, intercepted,
   };
 }
