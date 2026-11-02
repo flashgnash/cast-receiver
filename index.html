@@ -45,7 +45,7 @@
 </div></div>
 <script>
 "use strict";
-const VERSION = "7";
+const VERSION = "8";
 const NS = "urn:x-cast:io.github.flashgnash.mettaton";
 const SEEK_STEP_S = 10;
 // One press can arrive by more than one path (a key and a media command).
@@ -378,10 +378,11 @@ document.addEventListener("visibilitychange", () => send({ type: "visible", visi
 
 // ---- the media session
 
-// The device's remote reaches a web receiver through its media session, and
-// CAF rejects every media command while no media is loaded, so while a sender
-// is bound the page holds one: a second of generated silence, looped, never
-// fetched from anywhere.
+// Only when the sender asks (`hold`): CAF rejects every media command (a
+// phone's pause) while no media is loaded, so the page can hold a second of
+// generated silence, looped, never fetched from anywhere. Off by default: the
+// remote's keys reach the page as keys without it, and on the SHIELD the
+// held item's player covered the picture.
 // A video element and a video type: as audio, Google TV draws its own
 // now-playing screen over the page.
 const holder = document.createElement("video");
@@ -438,7 +439,7 @@ ctx.addCustomMessageListener(NS, (e) => {
     bound = { sender: e.senderId, token: m.token, from: typeof m.from === "string" ? m.from.slice(0, 64) : "", debug: m.debug === true };
     show("connecting", "Connecting", bound.from ? "from " + bound.from : "");
     send(Object.assign({ type: "ready" }, caps()));
-    holdSession(typeof m.hold === "string" ? m.hold : "video");
+    holdSession(typeof m.hold === "string" ? m.hold : "none");
     return;
   }
   if (!bound || e.senderId !== bound.sender || m.token !== bound.token) return;
