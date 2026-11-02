@@ -2,17 +2,367 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>mettaton cast receiver</title>
+<title>Cast receiver</title>
+<!-- The only request this page makes besides itself: Google's Cast receiver SDK. -->
 <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
 <style>
-  html, body { margin: 0; height: 100%; background: #1c1d1f; color: #e8e8e8;
-               font: 48px sans-serif; display: grid; place-items: center; }
+  :root {
+    --bg: #192227; --panel: #263238; --inset: #11181c;
+    --text: #ffffff; --dim: rgba(255, 255, 255, 0.55);
+    --accent: #9dff00; --critical: #BF616A;
+  }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text);
+               font-family: "ComicShannsMono Nerd Font", "DejaVu Sans Mono", monospace; }
+  /* CAF delivers remote keys only while its player element is in the page. */
+  cast-media-player { display: none; }
+  video { position: fixed; inset: 0; width: 100%; height: 100%; background: #000; object-fit: contain; display: none; }
+  body.playing video { display: block; }
+  #status { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2vh; }
+  body.playing #status { display: none; }
+  #headline { font-size: 5vh; }
+  #detail { font-size: 2.6vh; color: var(--dim); max-width: 70vw; text-align: center; }
+  #spin { font-size: 5vh; color: var(--accent); min-height: 6vh; }
+  body.error #headline { color: var(--critical); }
+  #overlay { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.55); }
+  #overlay.open { display: flex; }
+  #card { background: var(--bg); border-radius: 8px; padding: 4vh 4vw; display: flex; flex-direction: column; gap: 3vh; align-items: center; }
+  #card .q { font-size: 4vh; }
+  #card .hint { font-size: 2.2vh; color: var(--dim); }
+  .strip { display: flex; background: rgba(255, 255, 255, 0.13); border-radius: 5px; overflow: hidden; }
+  .strip div { min-width: 16vw; text-align: center; font-size: 3vh; padding: 1.4vh 2vw; color: var(--text); }
+  .strip div + div { box-shadow: -1px 0 0 rgba(255, 255, 255, 0.2); }
+  .strip div.on { background: var(--accent); color: #1a1a1a; font-weight: bold; }
 </style>
 </head>
 <body>
-<div>mettaton receiver: hello</div>
+<cast-media-player></cast-media-player>
+<video id="v" autoplay playsinline></video>
+<div id="status"><div id="spin"></div><div id="headline">Ready to cast</div><div id="detail"></div></div>
+<div id="overlay"><div id="card">
+  <div class="q">Stop casting?</div>
+  <div class="strip"><div id="o-keep" class="on">Keep watching</div><div id="o-stop">Stop</div></div>
+  <div class="hint">Back again keeps watching</div>
+</div></div>
 <script>
-  cast.framework.CastReceiverContext.getInstance().start({ disableIdleTimeout: true });
+"use strict";
+const VERSION = "2";
+const NS = "urn:x-cast:io.github.flashgnash.mettaton";
+const SEEK_STEP_S = 10;
+// One press can arrive by more than one path (a key and a media command).
+const SAME_PRESS_MS = 300;
+const OVERLAY_TIMEOUT_MS = 10000;
+const ICE_GATHER_MS = 2000;
+const STATS_EVERY_MS = 1000;
+
+const ctx = cast.framework.CastReceiverContext.getInstance();
+const video = document.getElementById("v");
+const $ = (id) => document.getElementById(id);
+
+// The one sender this page serves: whoever said hello first, with its token.
+let bound = null; // {sender, token}
+let pc = null;
+let statsTimer = null;
+let spinTimer = null;
+
+function send(msg) {
+  // Never broadcast: a message goes to the bound sender or nowhere.
+  if (!bound || !bound.sender) return;
+  msg.token = bound.token;
+  try { ctx.sendCustomMessage(NS, bound.sender, msg); } catch (e) {}
+}
+
+function show(state, headline, detail) {
+  document.body.className = state;
+  $("headline").textContent = headline || "";
+  $("detail").textContent = detail || "";
+  clearInterval(spinTimer);
+  $("spin").textContent = "";
+  if (state === "connecting") {
+    const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let i = 0;
+    spinTimer = setInterval(() => { $("spin").textContent = frames[i++ % frames.length]; }, 90);
+  }
+}
+
+function idle() {
+  show("idle", "Ready to cast", "");
+}
+
+function closePc() {
+  clearInterval(statsTimer);
+  statsTimer = null;
+  if (pc) { try { pc.close(); } catch (e) {} }
+  pc = null;
+  video.srcObject = null;
+}
+
+function caps() {
+  const c = { version: VERSION, webrtc: typeof RTCPeerConnection === "function", ua: navigator.userAgent,
+              gamepad: typeof navigator.getGamepads === "function", mediaSession: "mediaSession" in navigator,
+              intercepted };
+  try {
+    c.codecs = RTCRtpReceiver.getCapabilities("video").codecs.map((x) => x.mimeType + (x.sdpFmtpLine ? " " + x.sdpFmtpLine : ""));
+  } catch (e) { c.codecs = []; }
+  try { c.display = { w: screen.width, h: screen.height, dpr: devicePixelRatio }; } catch (e) {}
+  return c;
+}
+
+// Only IPv4 host candidates: no STUN (no requests off the LAN), and IPv6 and
+// mDNS names the sender can't use.
+function lanOnly(sdp) {
+  return sdp.split("\r\n").filter((l) => {
+    if (!l.startsWith("a=candidate:")) return true;
+    const addr = l.split(" ")[4] || "";
+    return /^\d+\.\d+\.\d+\.\d+$/.test(addr);
+  }).join("\r\n");
+}
+
+async function answer(offerSdp) {
+  closePc();
+  show("connecting", "Connecting", bound.from ? "from " + bound.from : "");
+  const p = new RTCPeerConnection({ iceServers: [], bundlePolicy: "max-bundle", rtcpMuxPolicy: "require" });
+  pc = p;
+  const stream = new MediaStream();
+  video.srcObject = stream;
+  p.ontrack = (e) => {
+    try { e.receiver.jitterBufferTarget = 0; } catch (x) {}
+    try { e.receiver.playoutDelayHint = 0; } catch (x) {}
+    stream.addTrack(e.track);
+    video.play().catch(() => {});
+  };
+  p.onconnectionstatechange = () => {
+    if (p !== pc) return;
+    send({ type: "state", pc: p.connectionState });
+    if (p.connectionState === "connected") show("playing");
+    else if (p.connectionState === "failed") show("error", "Connection lost", "Waiting for the sender");
+  };
+  await p.setRemoteDescription({ type: "offer", sdp: offerSdp });
+  await p.setLocalDescription(await p.createAnswer());
+  await new Promise((done) => {
+    if (p.iceGatheringState === "complete") return done();
+    const t = setTimeout(done, ICE_GATHER_MS);
+    p.addEventListener("icegatheringstatechange", () => { if (p.iceGatheringState === "complete") { clearTimeout(t); done(); } });
+  });
+  if (p !== pc) return;
+  send({ type: "answer", sdp: lanOnly(p.localDescription.sdp) });
+  statsTimer = setInterval(stats, STATS_EVERY_MS);
+}
+
+async function stats() {
+  if (!pc) return;
+  const out = { type: "stats" };
+  try {
+    (await pc.getStats()).forEach((s) => {
+      if (s.type === "inbound-rtp" && s.kind === "video") {
+        out.video = { frames: s.framesDecoded, dropped: s.framesDropped, fps: s.framesPerSecond, w: s.frameWidth, h: s.frameHeight,
+                      jb: s.jitterBufferDelay, jbCount: s.jitterBufferEmittedCount, decode: s.totalDecodeTime,
+                      lost: s.packetsLost, nacks: s.nackCount, plis: s.pliCount, playout: s.estimatedPlayoutTimestamp };
+      } else if (s.type === "inbound-rtp" && s.kind === "audio") {
+        out.audio = { jb: s.jitterBufferDelay, jbCount: s.jitterBufferEmittedCount,
+                      lost: s.packetsLost, concealed: s.concealedSamples, playout: s.estimatedPlayoutTimestamp };
+      } else if (s.type === "candidate-pair" && s.nominated && s.state === "succeeded") {
+        out.rttMs = s.currentRoundTripTime != null ? 1000 * s.currentRoundTripTime : null;
+      }
+    });
+  } catch (e) {}
+  out.now = Date.now();
+  send(out);
+}
+
+// ---- buttons
+
+let lastPress = { button: "", at: 0 };
+
+function press(button, via, extra) {
+  const now = Date.now();
+  if (overlayOpen()) return;
+  if (button === lastPress.button && now - lastPress.at < SAME_PRESS_MS) return;
+  lastPress = { button, at: now };
+  send(Object.assign({ type: "button", button, via }, extra || {}));
+}
+
+function back(via) {
+  if (overlayOpen()) return closeOverlay();
+  if (!bound) return ctx.stop();
+  openOverlay(via);
+}
+
+let overlayTimer = null;
+let overlayChoice = "keep";
+function overlayOpen() { return $("overlay").classList.contains("open"); }
+function choose(c) {
+  overlayChoice = c;
+  $("o-keep").classList.toggle("on", c === "keep");
+  $("o-stop").classList.toggle("on", c === "stop");
+}
+function openOverlay(via) {
+  choose("keep");
+  $("overlay").classList.add("open");
+  send({ type: "overlay", open: true, via });
+  clearTimeout(overlayTimer);
+  overlayTimer = setTimeout(closeOverlay, OVERLAY_TIMEOUT_MS);
+}
+function closeOverlay() {
+  clearTimeout(overlayTimer);
+  $("overlay").classList.remove("open");
+  send({ type: "overlay", open: false });
+}
+function confirmOverlay() {
+  const stop = overlayChoice === "stop";
+  closeOverlay();
+  if (stop) send({ type: "stop", why: "the TV's Back button" });
+}
+
+const KEYS = {
+  MediaPlayPause: ["play-pause"], MediaPlay: ["play"], MediaPause: ["pause"],
+  MediaTrackNext: ["next"], MediaTrackPrevious: ["previous"],
+  MediaFastForward: ["seek", { by: SEEK_STEP_S }], MediaRewind: ["seek", { by: -SEEK_STEP_S }],
+  ArrowRight: ["seek", { by: SEEK_STEP_S }], ArrowLeft: ["seek", { by: -SEEK_STEP_S }],
+  Enter: ["play-pause"], " ": ["play-pause"],
+};
+const BACK_KEYS = ["BrowserBack", "GoBack", "Escape", "Backspace"];
+
+function onKey(e) {
+  const name = e.key || "";
+  // Every key goes to the sender's log as it arrives, mapped or not.
+  send({ type: "input", via: "key", key: name, code: e.code, keyCode: e.keyCode });
+  if (BACK_KEYS.includes(name) || e.keyCode === 4 || e.keyCode === 461) {
+    e.preventDefault();
+    return back("key:" + name);
+  }
+  if (overlayOpen()) {
+    if (name === "ArrowLeft") choose("keep");
+    else if (name === "ArrowRight") choose("stop");
+    else if (name === "Enter" || name === " ") confirmOverlay();
+    e.preventDefault();
+    return;
+  }
+  const k = KEYS[name];
+  if (k) { e.preventDefault(); press(k[0], "key:" + name, k[1]); }
+}
+document.addEventListener("keydown", onKey, true);
+
+// Media commands from the remote's media keys (through the device's media
+// session) or any sender: reported, never acted on here.
+// What this SDK lets the page intercept (some message types it handles itself).
+const intercepted = [];
+function intercept() {
+  const pm = ctx.getPlayerManager();
+  const M = cast.framework.messages.MessageType;
+  const take = (type, f) => {
+    if (!type) return;
+    try {
+      pm.setMessageInterceptor(type, (req) => {
+        send({ type: "input", via: "caf", message: type });
+        f(req);
+        return null;
+      });
+      intercepted.push(type);
+    } catch (e) {}
+  };
+  take(M.PLAY, () => press("play", "caf:PLAY"));
+  take(M.PAUSE, () => press("pause", "caf:PAUSE"));
+  take(M.SEEK, (r) => {
+    if (typeof r.relativeTime === "number") press("seek", "caf:SEEK", { by: r.relativeTime });
+    else if (typeof r.currentTime === "number") press("seek", "caf:SEEK", { position: r.currentTime });
+  });
+  take(M.QUEUE_NEXT, () => press("next", "caf:QUEUE_NEXT"));
+  take(M.QUEUE_PREV, () => press("previous", "caf:QUEUE_PREV"));
+  take(M.QUEUE_UPDATE, (r) => { if (r.jump > 0) press("next", "caf:QUEUE_UPDATE"); else if (r.jump < 0) press("previous", "caf:QUEUE_UPDATE"); });
+  take(M.STOP, () => back("caf:STOP"));
+}
+
+function mediaSession() {
+  if (!("mediaSession" in navigator)) return;
+  const h = { play: ["play"], pause: ["pause"], nexttrack: ["next"], previoustrack: ["previous"],
+              seekforward: ["seek", { by: SEEK_STEP_S }], seekbackward: ["seek", { by: -SEEK_STEP_S }] };
+  for (const [action, b] of Object.entries(h)) {
+    try { navigator.mediaSession.setActionHandler(action, () => press(b[0], "mediasession:" + action, b[1])); } catch (e) {}
+  }
+  try { navigator.mediaSession.setActionHandler("stop", () => back("mediasession:stop")); } catch (e) {}
+}
+
+// The Gamepad API has no button events: its state is read each frame, and
+// only while a pad is connected.
+const PAD = { 0: ["play-pause"], 9: ["play-pause"], 4: ["previous"], 5: ["next"], 14: ["seek", { by: -SEEK_STEP_S }], 15: ["seek", { by: SEEK_STEP_S }] };
+const PAD_BACK = 1;
+let padHeld = {};
+let padFrame = null;
+function readPads() {
+  padFrame = null;
+  let any = false;
+  for (const g of navigator.getGamepads ? navigator.getGamepads() : []) {
+    if (!g) continue;
+    any = true;
+    g.buttons.forEach((b, i) => {
+      const id = g.index + ":" + i;
+      if (b.pressed && !padHeld[id]) {
+        send({ type: "input", via: "gamepad", pad: g.id, mapping: g.mapping, button: i });
+        if (overlayOpen()) {
+          if (i === 14) choose("keep");
+          else if (i === 15) choose("stop");
+          else if (i === 0) confirmOverlay();
+          else if (i === PAD_BACK) closeOverlay();
+        } else if (i === PAD_BACK) back("gamepad:" + i);
+        else if (PAD[i]) press(PAD[i][0], "gamepad:" + i, PAD[i][1]);
+      }
+      padHeld[id] = b.pressed;
+    });
+  }
+  if (any) padFrame = requestAnimationFrame(readPads);
+}
+window.addEventListener("gamepadconnected", () => { if (!padFrame) padFrame = requestAnimationFrame(readPads); });
+
+document.addEventListener("visibilitychange", () => send({ type: "visible", visible: document.visibilityState === "visible" }));
+
+// ---- the sender
+
+ctx.addCustomMessageListener(NS, (e) => {
+  const m = e.data;
+  if (!m || typeof m !== "object" || typeof m.token !== "string" || m.token.length < 32) return;
+  if (m.type === "hello") {
+    // A new token from the bound sender starts over; anyone else waits until it leaves.
+    if (bound && bound.sender !== e.senderId) return;
+    closePc();
+    bound = { sender: e.senderId, token: m.token, from: typeof m.from === "string" ? m.from.slice(0, 64) : "" };
+    show("connecting", "Connecting", bound.from ? "from " + bound.from : "");
+    send(Object.assign({ type: "ready" }, caps()));
+    return;
+  }
+  if (!bound || e.senderId !== bound.sender || m.token !== bound.token) return;
+  if (m.type === "offer" && typeof m.sdp === "string") {
+    answer(m.sdp).catch((x) => { send({ type: "error", why: String(x) }); show("error", "Couldn't connect", String(x)); });
+  } else if (m.type === "status" && typeof m.text === "string") {
+    show(m.error ? "error" : "connecting", m.text.slice(0, 120), (m.detail || "").slice(0, 200));
+  } else if (m.type === "bye") {
+    closePc();
+    bound = null;
+    idle();
+  }
+});
+
+ctx.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, (e) => {
+  if (bound && e.senderId === bound.sender) {
+    closePc();
+    bound = null;
+    idle();
+  }
+});
+
+intercept();
+mediaSession();
+idle();
+const opts = new cast.framework.CastReceiverOptions();
+opts.disableIdleTimeout = true;
+// No media player libraries: the page plays only its own WebRTC stream, and
+// loads nothing beyond the SDK.
+opts.skipPlayersLoad = true;
+opts.customNamespaces = { [NS]: cast.framework.system.MessageType.JSON };
+try {
+  opts.uiConfig = new cast.framework.ui.UiConfig();
+  opts.uiConfig.touchScreenOptimizedApp = true;
+} catch (e) {}
+ctx.start(opts);
 </script>
 </body>
 </html>
