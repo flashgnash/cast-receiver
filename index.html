@@ -45,7 +45,7 @@
 </div></div>
 <script>
 "use strict";
-const VERSION = "9";
+const VERSION = "10";
 const NS = "urn:x-cast:io.github.flashgnash.mettaton";
 const SEEK_STEP_S = 10;
 // One press can arrive by more than one path (a key and a media command).
@@ -102,6 +102,14 @@ function luma() {
   } catch (e) { return String(e); }
 }
 
+// Frames the video element says it presented, and those counted shown.
+function quality() {
+  try {
+    const q = video.getVideoPlaybackQuality();
+    return { total: q.totalVideoFrames, dropped: q.droppedVideoFrames, callbacks: shownCount };
+  } catch (e) { return { callbacks: shownCount }; }
+}
+
 // Everything the page knows about itself now.
 function report() {
   let player = null;
@@ -112,7 +120,8 @@ function report() {
   return {
     type: "report", version: VERSION, state: document.body.className, headline: $("headline").textContent,
     pc: pc ? { connection: pc.connectionState, ice: pc.iceConnectionState } : null,
-    video: { w: video.videoWidth, h: video.videoHeight, paused: video.paused, readyState: video.readyState, luma: luma() },
+    video: { w: video.videoWidth, h: video.videoHeight, paused: video.paused, readyState: video.readyState, luma: luma(), shown: quality(),
+             box: (() => { try { const r = video.getBoundingClientRect(); return [r.width, r.height]; } catch (e) { return null; } })() },
     overlay: overlayOpen(), overlayChoice, player, visible: document.visibilityState, intercepted,
   };
 }
@@ -235,7 +244,9 @@ async function stats() {
 // mapped through its reports) or its arrival, to the screen.
 let glass = { capture: [], receive: [] };
 let watching = false;
+let shownCount = 0;
 function shown(now, m) {
+  shownCount++;
   if (typeof m.captureTime === "number" && m.captureTime > 0) glass.capture.push(m.expectedDisplayTime - m.captureTime);
   else if (typeof m.receiveTime === "number" && m.receiveTime > 0) glass.receive.push(m.expectedDisplayTime - m.receiveTime);
   if (glass.capture.length + glass.receive.length > 600) glass = { capture: [], receive: [] };
