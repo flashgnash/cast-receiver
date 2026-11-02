@@ -45,7 +45,7 @@
 </div></div>
 <script>
 "use strict";
-const VERSION = "3";
+const VERSION = "5";
 const NS = "urn:x-cast:io.github.flashgnash.mettaton";
 const SEEK_STEP_S = 10;
 // One press can arrive by more than one path (a key and a media command).
@@ -107,6 +107,14 @@ function caps() {
   return c;
 }
 
+// The sender's sound is stereo; Chrome decodes Opus as mono unless its own
+// description asks for stereo.
+function stereo(sdp) {
+  const pt = (sdp.match(/a=rtpmap:(\d+) opus\/48000/i) || [])[1];
+  if (!pt) return sdp;
+  return sdp.replace(new RegExp("a=fmtp:" + pt + " ([^\r\n]*)"), (l, params) => params.includes("stereo=") ? l : l + ";stereo=1;sprop-stereo=1");
+}
+
 // Only IPv4 host candidates: no STUN (no requests off the LAN), and IPv6 and
 // mDNS names the sender can't use.
 function lanOnly(sdp) {
@@ -129,6 +137,10 @@ async function answer(offerSdp) {
     try { e.receiver.playoutDelayHint = 0; } catch (x) {}
     stream.addTrack(e.track);
     video.play().catch(() => {});
+    if (e.track.kind === "video" && video.requestVideoFrameCallback && !watching) {
+      watching = true;
+      video.requestVideoFrameCallback(shown);
+    }
   };
   p.onconnectionstatechange = () => {
     if (p !== pc) return;
@@ -137,7 +149,8 @@ async function answer(offerSdp) {
     else if (p.connectionState === "failed") show("error", "Connection lost", "Waiting for the sender");
   };
   await p.setRemoteDescription({ type: "offer", sdp: offerSdp });
-  await p.setLocalDescription(await p.createAnswer());
+  const a = await p.createAnswer();
+  await p.setLocalDescription({ type: "answer", sdp: stereo(a.sdp) });
   await new Promise((done) => {
     if (p.iceGatheringState === "complete") return done();
     const t = setTimeout(done, ICE_GATHER_MS);
@@ -165,8 +178,23 @@ async function stats() {
       }
     });
   } catch (e) {}
+  const mid = (a) => (a.length ? a.slice().sort((x, y) => x - y)[a.length >> 1] : null);
+  out.glass = { captureMs: mid(glass.capture), receiveMs: mid(glass.receive), frames: glass.capture.length + glass.receive.length };
+  glass = { capture: [], receive: [] };
   out.now = Date.now();
   send(out);
+}
+
+// How long each shown picture took from its capture (the sender's clock
+// mapped through its reports) or its arrival, to the screen.
+let glass = { capture: [], receive: [] };
+let watching = false;
+function shown(now, m) {
+  if (typeof m.captureTime === "number" && m.captureTime > 0) glass.capture.push(m.expectedDisplayTime - m.captureTime);
+  else if (typeof m.receiveTime === "number" && m.receiveTime > 0) glass.receive.push(m.expectedDisplayTime - m.receiveTime);
+  if (glass.capture.length + glass.receive.length > 600) glass = { capture: [], receive: [] };
+  if (pc) video.requestVideoFrameCallback(shown);
+  else watching = false;
 }
 
 // ---- buttons
@@ -349,7 +377,14 @@ function holdSession() {
     req.media.metadata = new cast.framework.messages.GenericMediaMetadata();
     req.media.metadata.title = bound && bound.from ? "Casting from " + bound.from : "Casting";
     req.autoplay = true;
-    pm.load(req).then(() => { holder.loop = true; send({ type: "session", held: true }); },
+    pm.load(req).then(() => {
+      holder.loop = true;
+      try {
+        const C = cast.framework.messages.Command;
+        pm.setSupportedMediaCommands(C.ALL_BASIC_MEDIA | C.QUEUE_NEXT | C.QUEUE_PREV, true);
+      } catch (x) {}
+      send({ type: "session", held: true });
+    },
                       (x) => send({ type: "session", held: false, why: String(x && (x.detailedErrorCode || x.reason || x.type) || x) }));
   } catch (x) { send({ type: "session", held: false, why: String(x) }); }
 }
