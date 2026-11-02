@@ -45,7 +45,7 @@
 </div></div>
 <script>
 "use strict";
-const VERSION = "2";
+const VERSION = "3";
 const NS = "urn:x-cast:io.github.flashgnash.mettaton";
 const SEEK_STEP_S = 10;
 // One press can arrive by more than one path (a key and a media command).
@@ -260,8 +260,11 @@ function intercept() {
       intercepted.push(type);
     } catch (e) {}
   };
-  take(M.PLAY, () => press("play", "caf:PLAY"));
-  take(M.PAUSE, () => press("pause", "caf:PAUSE"));
+  // The page's media session never changes state, so the device turns its
+  // one play/pause key into PLAY or PAUSE by that state, not by the
+  // source's: either is a toggle of the source.
+  take(M.PLAY, () => press("play-pause", "caf:PLAY"));
+  take(M.PAUSE, () => press("play-pause", "caf:PAUSE"));
   take(M.SEEK, (r) => {
     if (typeof r.relativeTime === "number") press("seek", "caf:SEEK", { by: r.relativeTime });
     else if (typeof r.currentTime === "number") press("seek", "caf:SEEK", { position: r.currentTime });
@@ -315,6 +318,45 @@ window.addEventListener("gamepadconnected", () => { if (!padFrame) padFrame = re
 
 document.addEventListener("visibilitychange", () => send({ type: "visible", visible: document.visibilityState === "visible" }));
 
+// ---- the media session
+
+// The device's remote reaches a web receiver through its media session, and
+// CAF rejects every media command while no media is loaded, so while a sender
+// is bound the page holds one: a second of generated silence, looped, never
+// fetched from anywhere.
+const holder = document.createElement("audio");
+let holderUrl = null;
+function silence() {
+  const rate = 8000, n = rate, b = new DataView(new ArrayBuffer(44 + n));
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) b.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, "RIFF"); b.setUint32(4, 36 + n, true); str(8, "WAVEfmt "); b.setUint32(16, 16, true);
+  b.setUint16(20, 1, true); b.setUint16(22, 1, true); b.setUint32(24, rate, true); b.setUint32(28, rate, true);
+  b.setUint16(32, 1, true); b.setUint16(34, 8, true); str(36, "data"); b.setUint32(40, n, true);
+  for (let i = 0; i < n; i++) b.setUint8(44 + i, 128);
+  return b.buffer;
+}
+function holdSession() {
+  const pm = ctx.getPlayerManager();
+  if (!holderUrl) holderUrl = URL.createObjectURL(new Blob([silence()], { type: "audio/wav" }));
+  try {
+    pm.setMediaElement(holder);
+    const req = new cast.framework.messages.LoadRequestData();
+    req.media = new cast.framework.messages.MediaInformation();
+    req.media.contentId = holderUrl;
+    req.media.contentUrl = holderUrl;
+    req.media.contentType = "audio/wav";
+    req.media.streamType = cast.framework.messages.StreamType.LIVE;
+    req.media.metadata = new cast.framework.messages.GenericMediaMetadata();
+    req.media.metadata.title = bound && bound.from ? "Casting from " + bound.from : "Casting";
+    req.autoplay = true;
+    pm.load(req).then(() => { holder.loop = true; send({ type: "session", held: true }); },
+                      (x) => send({ type: "session", held: false, why: String(x && (x.detailedErrorCode || x.reason || x.type) || x) }));
+  } catch (x) { send({ type: "session", held: false, why: String(x) }); }
+}
+function releaseSession() {
+  try { ctx.getPlayerManager().stop(); } catch (x) {}
+}
+
 // ---- the sender
 
 ctx.addCustomMessageListener(NS, (e) => {
@@ -327,6 +369,7 @@ ctx.addCustomMessageListener(NS, (e) => {
     bound = { sender: e.senderId, token: m.token, from: typeof m.from === "string" ? m.from.slice(0, 64) : "" };
     show("connecting", "Connecting", bound.from ? "from " + bound.from : "");
     send(Object.assign({ type: "ready" }, caps()));
+    holdSession();
     return;
   }
   if (!bound || e.senderId !== bound.sender || m.token !== bound.token) return;
@@ -337,6 +380,7 @@ ctx.addCustomMessageListener(NS, (e) => {
   } else if (m.type === "bye") {
     closePc();
     bound = null;
+    releaseSession();
     idle();
   }
 });
@@ -345,6 +389,7 @@ ctx.addEventListener(cast.framework.system.EventType.SENDER_DISCONNECTED, (e) =>
   if (bound && e.senderId === bound.sender) {
     closePc();
     bound = null;
+    releaseSession();
     idle();
   }
 });
