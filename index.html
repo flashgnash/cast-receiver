@@ -45,7 +45,7 @@
 </div></div>
 <script>
 "use strict";
-const VERSION = "5";
+const VERSION = "6";
 const NS = "urn:x-cast:io.github.flashgnash.mettaton";
 const SEEK_STEP_S = 10;
 // One press can arrive by more than one path (a key and a media command).
@@ -69,6 +69,36 @@ function send(msg) {
   if (!bound || !bound.sender) return;
   msg.token = bound.token;
   try { ctx.sendCustomMessage(NS, bound.sender, msg); } catch (e) {}
+}
+
+// ---- debug: only for a bound sender that asked for it in its hello
+
+function debug(what, detail) {
+  if (bound && bound.debug) send({ type: "debug", what, detail: String(detail).slice(0, 2000) });
+}
+for (const level of ["log", "info", "warn", "error"]) {
+  const orig = console[level];
+  console[level] = function (...args) {
+    try { orig.apply(console, args); } catch (e) {}
+    debug("console." + level, args.map((a) => { try { return typeof a === "string" ? a : JSON.stringify(a); } catch (e) { return String(a); } }).join(" "));
+  };
+}
+window.addEventListener("error", (e) => debug("error", (e.message || "") + " at " + (e.filename || "") + ":" + (e.lineno || "")));
+window.addEventListener("unhandledrejection", (e) => debug("rejection", e.reason && (e.reason.stack || e.reason)));
+
+// Everything the page knows about itself now.
+function report() {
+  let player = null;
+  try {
+    const pm = ctx.getPlayerManager();
+    player = { state: pm.getPlayerState(), media: !!pm.getMediaInformation() };
+  } catch (e) { player = { error: String(e) }; }
+  return {
+    type: "report", version: VERSION, state: document.body.className, headline: $("headline").textContent,
+    pc: pc ? { connection: pc.connectionState, ice: pc.iceConnectionState } : null,
+    video: { w: video.videoWidth, h: video.videoHeight, paused: video.paused, readyState: video.readyState },
+    overlay: overlayOpen(), overlayChoice, player, visible: document.visibilityState, intercepted,
+  };
 }
 
 function show(state, headline, detail) {
@@ -401,7 +431,7 @@ ctx.addCustomMessageListener(NS, (e) => {
     // A new token from the bound sender starts over; anyone else waits until it leaves.
     if (bound && bound.sender !== e.senderId) return;
     closePc();
-    bound = { sender: e.senderId, token: m.token, from: typeof m.from === "string" ? m.from.slice(0, 64) : "" };
+    bound = { sender: e.senderId, token: m.token, from: typeof m.from === "string" ? m.from.slice(0, 64) : "", debug: m.debug === true };
     show("connecting", "Connecting", bound.from ? "from " + bound.from : "");
     send(Object.assign({ type: "ready" }, caps()));
     holdSession();
@@ -412,6 +442,8 @@ ctx.addCustomMessageListener(NS, (e) => {
     answer(m.sdp).catch((x) => { send({ type: "error", why: String(x) }); show("error", "Couldn't connect", String(x)); });
   } else if (m.type === "status" && typeof m.text === "string") {
     show(m.error ? "error" : "connecting", m.text.slice(0, 120), (m.detail || "").slice(0, 200));
+  } else if (m.type === "report") {
+    send(report());
   } else if (m.type === "bye") {
     closePc();
     bound = null;
